@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  weather-bot:
+    build: .
+    container_name: telegram-weather-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      # Optional: Mount logs directory
+      - ./logs:/app/logs
+    networks:
+      - bot-network
+    
+    # Optional: Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: '0.1'
+        reservations:
+          memory: 64M
+          cpus: '0.05'
+
+networks:
+  bot-network:
+    driver: bridgex
