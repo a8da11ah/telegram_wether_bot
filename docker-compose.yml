@@ -14,7 +14,7 @@ services:
       - ./logs:/app/logs
     networks:
       - bot-network
-    
+
     # Optional: Resource limits
     deploy:
       resources:
@@ -27,4 +27,4 @@ services:
 
 networks:
   bot-network:
-    driver: bridgex
+    driver: bridge
