@@ -41,9 +41,17 @@ The content is organized as follows:
 
 <directory_structure>
 .dockerignore
+config.py
+data_store.py
 docker-compose.yml
 Dockerfile
+handlers/callback_handlers.py
+handlers/command_handlers.py
+localization.py
+main.py
 requirements.txt
+utils.py
+weather_api.py
 weather_bot.py
 </directory_structure>
 
@@ -64,6 +72,1170 @@ README.md
 .coverage
 .vscode/
 .idea/
+</file>
+
+<file path="config.py">
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+WEATHER_API_KEY = os.getenv("WEATHER_API_KEY")
+
+if not TELEGRAM_BOT_TOKEN or not WEATHER_API_KEY:
+    raise ValueError("Missing required environment variables! Please set TELEGRAM_BOT_TOKEN and WEATHER_API_KEY in your .env file.")
+
+# API URLs
+WEATHER_API_URL = "https://api.openweathermap.org/data/2.5/weather"
+FORECAST_API_URL = "https://api.openweathermap.org/data/2.5/forecast"
+GEOCODING_API_URL = "https://api.openweathermap.org/geo/1.0/direct"
+
+# Other configurations
+DEFAULT_UNIT = "metric"
+DEFAULT_LANGUAGE = "en"
+MAX_FAVORITES = 10
+MAX_COMPARE_CITIES = 4
+REQUEST_TIMEOUT = 10
+</file>
+
+<file path="data_store.py">
+import json
+import logging
+from typing import Dict, List
+from dataclasses import dataclass, asdict
+
+logger = logging.getLogger(__name__)
+
+@dataclass
+class UserPreferences:
+    """User preferences data class"""
+    unit: str = "metric"
+    language: str = "en"
+    favorites: List[str] = None
+    default_city: str = None
+    
+    def __post_init__(self):
+        if self.favorites is None:
+            self.favorites = []
+
+class UserDataStore:
+    def __init__(self, filename: str = 'user_preferences.json'):
+        self.filename = filename
+        self.user_preferences: Dict[int, UserPreferences] = {}
+        self.load_user_data()
+
+    def load_user_data(self):
+        """Load user preferences from file."""
+        try:
+            if os.path.exists(self.filename):
+                with open(self.filename, 'r') as f:
+                    data = json.load(f)
+                    for user_id, prefs_data in data.items():
+                        # Ensure favorites is a list if it was null/None in JSON
+                        if 'favorites' in prefs_data and prefs_data['favorites'] is None:
+                            prefs_data['favorites'] = []
+                        self.user_preferences[int(user_id)] = UserPreferences(**prefs_data)
+            logger.info(f"Loaded preferences for {len(self.user_preferences)} users.")
+        except Exception as e:
+            logger.error(f"Error loading user data from {self.filename}: {e}")
+
+    def save_user_data(self):
+        """Save user preferences to file."""
+        try:
+            data_to_save = {str(user_id): asdict(prefs) for user_id, prefs in self.user_preferences.items()}
+            with open(self.filename, 'w') as f:
+                json.dump(data_to_save, f, indent=2)
+            logger.info(f"Saved preferences for {len(self.user_preferences)} users.")
+        except Exception as e:
+            logger.error(f"Error saving user data to {self.filename}: {e}")
+
+    def get_user_prefs(self, user_id: int) -> UserPreferences:
+        """Get user preferences or create default if not exists."""
+        if user_id not in self.user_preferences:
+            self.user_preferences[user_id] = UserPreferences()
+            self.save_user_data() # Save new user's default prefs immediately
+        return self.user_preferences[user_id]
+
+    def reset_user_prefs(self, user_id: int):
+        """Resets user preferences to default."""
+        self.user_preferences[user_id] = UserPreferences()
+        self.save_user_data()
+</file>
+
+<file path="handlers/callback_handlers.py">
+import logging
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ContextTypes
+from data_store import UserDataStore
+from localization import get_localized_message
+from handlers.command_handlers import send_current_weather, settings_command # Import settings_command to reuse it
+from config import MAX_FAVORITES # Also need to access MAX_FAVORITES here
+
+logger = logging.getLogger(__name__)
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle inline keyboard callbacks."""
+    query = update.callback_query
+    await query.answer() # Acknowledge the callback query
+    
+    data = query.data
+    user_id = update.effective_user.id
+    user_data_store: UserDataStore = context.bot_data['user_data_store']
+    weather_api_client = context.bot_data['weather_api_client']
+    prefs = user_data_store.get_user_prefs(user_id)
+    
+    if data.startswith("weather_"):
+        city = data.replace("weather_", "")
+        await send_current_weather(update, city, prefs, weather_api_client, edit_message=True)
+    
+    elif data.startswith("addfav_"):
+        city = data.replace("addfav_", "")
+        if city.lower() not in [fav.lower() for fav in prefs.favorites]:
+            prefs.favorites.append(city)
+            user_data_store.save_user_data()
+            await query.edit_message_text(get_localized_message(prefs.language, "added_favorite", city=city))
+        else:
+            await query.edit_message_text(get_localized_message(prefs.language, "already_favorite", city=city))
+        # Optionally, refresh the message or go back to main menu
+
+    elif data == "toggle_units":
+        prefs.unit = "imperial" if prefs.unit == "metric" else "metric"
+        user_data_store.save_user_data()
+        await settings_command(update, context) # Re-send settings menu with updated unit
+    
+    elif data == "choose_language":
+        keyboard = [
+            [InlineKeyboardButton(get_localized_message(prefs.language, "english"), callback_data="set_lang_en")],
+            [InlineKeyboardButton(get_localized_message(prefs.language, "arabic"), callback_data="set_lang_ar")],
+            [InlineKeyboardButton(get_localized_message(prefs.language, "manage_favorites_back"), callback_data="back_to_settings")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            get_localized_message(prefs.language, "choose_language"),
+            parse_mode='HTML',
+            reply_markup=reply_markup
+        )
+    
+    elif data.startswith("set_lang_"):
+        lang_code = data.replace("set_lang_", "")
+        prefs.language = lang_code
+        user_data_store.save_user_data()
+        language_name = get_localized_message(prefs.language, lang_code)
+        await query.edit_message_text(get_localized_message(prefs.language, "language_set", language_name=language_name))
+        await settings_command(update, context) # Go back to main settings menu
+        
+    elif data == "set_default_city":
+        await query.edit_message_text(
+            get_localized_message(prefs.language, "set_default_city_instructions"),
+            parse_mode='HTML'
+        )
+    
+    elif data == "manage_favorites":
+        if not prefs.favorites:
+            await query.edit_message_text(
+                get_localized_message(prefs.language, "no_favorites"),
+                parse_mode='HTML'
+            )
+            return
+        
+        keyboard = []
+        for city in prefs.favorites:
+            keyboard.append([InlineKeyboardButton(f"🗑️ Remove {city}", callback_data=f"removefav_callback_{city}")])
+        
+        keyboard.append([InlineKeyboardButton(get_localized_message(prefs.language, "manage_favorites_back"), callback_data="back_to_settings")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            get_localized_message(prefs.language, "manage_favorites_menu"),
+            parse_mode='HTML',
+            reply_markup=reply_markup
+        )
+    
+    elif data.startswith("removefav_callback_"):
+        city = data.replace("removefav_callback_", "")
+        if city in prefs.favorites:
+            prefs.favorites.remove(city)
+            user_data_store.save_user_data()
+            await query.edit_message_text(get_localized_message(prefs.language, "removed_favorite", city=city))
+            await handle_callback(update, context) # Refresh the manage favorites list
+        else:
+            await query.edit_message_text(get_localized_message(prefs.language, "not_in_favorites", city=city))
+    
+    elif data == "back_to_settings":
+        await settings_command(update, context)
+    
+    elif data == "reset_settings":
+        user_data_store.reset_user_prefs(user_id)
+        await query.edit_message_text(get_localized_message(prefs.language, "reset_settings_confirm"))
+    
+    # Handle help menu callbacks (from /start)
+    elif data.startswith("help_"):
+        help_type = data.replace("help_", "")
+        # For simplicity, these just send a generic help message.
+        # You could expand this to send specific help for each section.
+        await query.edit_message_text(get_localized_message(prefs.language, "help"), parse_mode='HTML')
+</file>
+
+<file path="handlers/command_handlers.py">
+import logging
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ContextTypes
+from data_store import UserDataStore, UserPreferences
+from localization import get_localized_message
+from weather_api import WeatherAPI
+from utils import format_weather_message, format_forecast_message, get_weather_emoji
+from config import MAX_FAVORITES, MAX_COMPARE_CITIES
+
+logger = logging.getLogger(__name__)
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command."""
+    user_id = update.effective_user.id
+    user_data_store: UserDataStore = context.bot_data['user_data_store']
+    prefs = user_data_store.get_user_prefs(user_id)
+    
+    keyboard = [
+        [InlineKeyboardButton(get_localized_message(prefs.language, "current_weather_button"), callback_data="help_weather")],
+        [InlineKeyboardButton(get_localized_message(prefs.language, "five_day_forecast_button"), callback_data="help_forecast")],
+        [InlineKeyboardButton(get_localized_message(prefs.language, "search_cities_button"), callback_data="help_search")],
+        [InlineKeyboardButton(get_localized_message(prefs.language, "favorites_button"), callback_data="help_favorites")],
+        [InlineKeyboardButton(get_localized_message(prefs.language, "settings_button"), callback_data="help_settings")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    welcome_message = get_localized_message(prefs.language, "welcome")
+    await update.message.reply_text(welcome_message, parse_mode='HTML', reply_markup=reply_markup)
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /help command."""
+    user_id = update.effective_user.id
+    user_data_store: UserDataStore = context.bot_data['user_data_store']
+    prefs = user_data_store.get_user_prefs(user_id)
+    help_message = get_localized_message(prefs.language, "help")
+    await update.message.reply_text(help_message, parse_mode='HTML')
+
+async def weather_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /weather command."""
+    user_id = update.effective_user.id
+    user_data_store: UserDataStore = context.bot_data['user_data_store']
+    weather_api_client: WeatherAPI = context.bot_data['weather_api_client']
+    prefs = user_data_store.get_user_prefs(user_id)
+    
+    city = None
+    if context.args:
+        city = " ".join(context.args)
+    elif prefs.default_city:
+        city = prefs.default_city
+    
+    if not city:
+        await update.message.reply_text(get_localized_message(prefs.language, "specify_city_weather"), parse_mode='HTML')
+        return
+
+    await send_current_weather(update, city, prefs, weather_api_client)
+
+async def forecast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /forecast command."""
+    user_id = update.effective_user.id
+    user_data_store: UserDataStore = context.bot_data['user_data_store']
+    weather_api_client: WeatherAPI = context.bot_data['weather_api_client']
+    prefs = user_data_store.get_user_prefs(user_id)
+    
+    city = None
+    if context.args:
+        city = " ".join(context.args)
+    elif prefs.default_city:
+        city = prefs.default_city
+    
+    if not city:
+        await update.message.reply_text(get_localized_message(prefs.language, "specify_city_forecast"), parse_mode='HTML')
+        return
+    
+    await send_five_day_forecast(update, city, prefs, weather_api_client)
+
+async def search_cities(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Search for cities."""
+    user_id = update.effective_user.id
+    user_data_store: UserDataStore = context.bot_data['user_data_store']
+    weather_api_client: WeatherAPI = context.bot_data['weather_api_client']
+    prefs = user_data_store.get_user_prefs(user_id)
+
+    if not context.args:
+        await update.message.reply_text(get_localized_message(prefs.language, "specify_query_search"), parse_mode='HTML')
+        return
+    
+    query = " ".join(context.args)
+    await update.message.reply_chat_action(action="typing")
+    
+    city_data = await weather_api_client.get_city_coordinates(query)
+    
+    if not city_data:
+        await update.message.reply_text(get_localized_message(prefs.language, "error_searching_cities"))
+        return
+    
+    if not city_data:
+        await update.message.reply_text(get_localized_message(prefs.language, "no_cities_found_search", query=query))
+        return
+    
+    keyboard = []
+    city_list_str = ""
+    
+    for i, city_info in enumerate(city_data[:8], 1): # Limit to 8 results
+        name = city_info['name']
+        country = city_info.get('country', '')
+        state = city_info.get('state', '')
+        
+        full_name = f"{name}, {country}"
+        if state and state != name:
+            full_name = f"{name}, {state}, {country}"
+        
+        city_list_str += f"{i}. {full_name}\n"
+        keyboard.append([InlineKeyboardButton(f"🌤️ {full_name}", callback_data=f"weather_{name}")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    message = get_localized_message(prefs.language, "cities_matching_search", query=query, city_list=city_list_str)
+    await update.message.reply_text(message, parse_mode='HTML', reply_markup=reply_markup)
+
+async def favorites_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show favorite cities."""
+    user_id = update.effective_user.id
+    user_data_store: UserDataStore = context.bot_data['user_data_store']
+    prefs = user_data_store.get_user_prefs(user_id)
+    
+    if not prefs.favorites:
+        await update.message.reply_text(get_localized_message(prefs.language, "no_favorites"), parse_mode='HTML')
+        return
+    
+    keyboard = []
+    for city in prefs.favorites[:MAX_FAVORITES]:
+        keyboard.append([InlineKeyboardButton(f"🌤️ {city}", callback_data=f"weather_{city}")])
+    
+    keyboard.append([InlineKeyboardButton(get_localized_message(prefs.language, "manage_favorites_button"), callback_data="manage_favorites")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    message = get_localized_message(prefs.language, "favorites_list", count=len(prefs.favorites))
+    await update.message.reply_text(message, parse_mode='HTML', reply_markup=reply_markup)
+
+async def add_favorite(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add city to favorites."""
+    user_id = update.effective_user.id
+    user_data_store: UserDataStore = context.bot_data['user_data_store']
+    weather_api_client: WeatherAPI = context.bot_data['weather_api_client']
+    prefs = user_data_store.get_user_prefs(user_id)
+
+    if not context.args:
+        await update.message.reply_text(get_localized_message(prefs.language, "specify_city_addfav"), parse_mode='HTML')
+        return
+    
+    city = " ".join(context.args)
+    
+    if not await weather_api_client.verify_city_exists(city, prefs.language):
+        await update.message.reply_text(get_localized_message(prefs.language, "city_not_found", city=city))
+        return
+    
+    if city.lower() not in [fav.lower() for fav in prefs.favorites]:
+        prefs.favorites.append(city)
+        user_data_store.save_user_data()
+        await update.message.reply_text(get_localized_message(prefs.language, "added_favorite", city=city))
+    else:
+        await update.message.reply_text(get_localized_message(prefs.language, "already_favorite", city=city))
+
+async def remove_favorite(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove city from favorites."""
+    user_id = update.effective_user.id
+    user_data_store: UserDataStore = context.bot_data['user_data_store']
+    prefs = user_data_store.get_user_prefs(user_id)
+
+    if not context.args:
+        await update.message.reply_text(get_localized_message(prefs.language, "specify_city_removefav"), parse_mode='HTML')
+        return
+    
+    city_to_remove = " ".join(context.args)
+    
+    found = False
+    for fav in prefs.favorites[:]: # Iterate over a copy
+        if fav.lower() == city_to_remove.lower():
+            prefs.favorites.remove(fav)
+            user_data_store.save_user_data()
+            await update.message.reply_text(get_localized_message(prefs.language, "removed_favorite", city=fav))
+            found = True
+            break
+    
+    if not found:
+        await update.message.reply_text(get_localized_message(prefs.language, "not_in_favorites", city=city_to_remove))
+
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show settings menu."""
+    user_id = update.effective_user.id
+    user_data_store: UserDataStore = context.bot_data['user_data_store']
+    prefs = user_data_store.get_user_prefs(user_id)
+    
+    unit_name = get_localized_message(prefs.language, "units_celsius") if prefs.unit == "metric" else get_localized_message(prefs.language, "units_fahrenheit")
+    language_name = get_localized_message(prefs.language, prefs.language)
+    default_city_name = prefs.default_city or get_localized_message(prefs.language, "default_city_not_set")
+
+    keyboard = [
+        [InlineKeyboardButton(get_localized_message(prefs.language, "units_toggle_button", unit_name=unit_name), callback_data="toggle_units")],
+        [InlineKeyboardButton(get_localized_message(prefs.language, "language_toggle_button", language_name=language_name), callback_data="choose_language")],
+        [InlineKeyboardButton(get_localized_message(prefs.language, "default_city_button", city_name=default_city_name), callback_data="set_default_city")],
+        [InlineKeyboardButton(get_localized_message(prefs.language, "manage_favorites_button"), callback_data="manage_favorites")],
+        [InlineKeyboardButton(get_localized_message(prefs.language, "reset_settings_button"), callback_data="reset_settings")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    message = get_localized_message(
+        prefs.language, 
+        "settings_menu", 
+        unit=unit_name, 
+        language=language_name, 
+        default_city=default_city_name, 
+        fav_count=len(prefs.favorites)
+    )
+    if update.callback_query: # If triggered by a callback, edit message
+        await update.callback_query.edit_message_text(message, parse_mode='HTML', reply_markup=reply_markup)
+    else: # If triggered by command
+        await update.message.reply_text(message, parse_mode='HTML', reply_markup=reply_markup)
+
+async def weather_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show weather alerts for a city."""
+    user_id = update.effective_user.id
+    user_data_store: UserDataStore = context.bot_data['user_data_store']
+    weather_api_client: WeatherAPI = context.bot_data['weather_api_client']
+    prefs = user_data_store.get_user_prefs(user_id)
+    
+    city = None
+    if context.args:
+        city = " ".join(context.args)
+    elif prefs.default_city:
+        city = prefs.default_city
+    
+    if not city:
+        await update.message.reply_text(get_localized_message(prefs.language, "specify_city_alerts"), parse_mode='HTML')
+        return
+    
+    await update.message.reply_chat_action(action="typing")
+    weather_data = await weather_api_client.get_current_weather(city, prefs.unit, prefs.language)
+
+    if not weather_data:
+        if weather_data and weather_data.get("error") == "city_not_found":
+            await update.message.reply_text(get_localized_message(prefs.language, "city_not_found", city=city))
+        else:
+            await update.message.reply_text(get_localized_message(prefs.language, "error_fetching_alerts"))
+        return
+    
+    alerts = []
+    
+    temp = weather_data['main']['temp']
+    humidity = weather_data['main']['humidity']
+    wind_speed = weather_data.get('wind', {}).get('speed', 0)
+    weather_id = weather_data['weather'][0]['id']
+    
+    if prefs.unit == 'metric':
+        if temp > 35:
+            alerts.append(get_localized_message(prefs.language, "extreme_heat_warning"))
+        elif temp < -10:
+            alerts.append(get_localized_message(prefs.language, "extreme_cold_warning"))
+        if wind_speed > 10:
+            alerts.append(get_localized_message(prefs.language, "high_wind_alert"))
+    else: # imperial
+        if temp > 95:
+            alerts.append(get_localized_message(prefs.language, "extreme_heat_warning"))
+        elif temp < 14:
+            alerts.append(get_localized_message(prefs.language, "extreme_cold_warning"))
+        if wind_speed > 22:
+            alerts.append(get_localized_message(prefs.language, "high_wind_alert"))
+    
+    if humidity > 85:
+        alerts.append(get_localized_message(prefs.language, "high_humidity_alert"))
+    
+    if weather_id < 300:
+        alerts.append(get_localized_message(prefs.language, "thunderstorm_alert"))
+    elif weather_id < 600 and weather_id >= 500:
+        alerts.append(get_localized_message(prefs.language, "heavy_rain_alert"))
+    elif weather_id < 700 and weather_id >= 600:
+        alerts.append(get_localized_message(prefs.language, "snow_alert"))
+    
+    city_name = f"{weather_data['name']}, {weather_data['sys']['country']}"
+    
+    if alerts:
+        alerts_list_str = "\n".join(f"• {alert}" for alert in alerts)
+        message = get_localized_message(prefs.language, "alerts_for_city", city=city_name, alerts_list=alerts_list_str, temp=f"{temp}°{'C' if prefs.unit == 'metric' else 'F'}")
+    else:
+        message = get_localized_message(prefs.language, "no_alerts", city=city_name)
+    
+    await update.message.reply_text(message, parse_mode='HTML')
+
+async def compare_cities(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Compare weather between cities."""
+    user_id = update.effective_user.id
+    user_data_store: UserDataStore = context.bot_data['user_data_store']
+    weather_api_client: WeatherAPI = context.bot_data['weather_api_client']
+    prefs = user_data_store.get_user_prefs(user_id)
+
+    if not context.args:
+        await update.message.reply_text(get_localized_message(prefs.language, "specify_cities_compare"), parse_mode='HTML')
+        return
+    
+    cities_input = " ".join(context.args)
+    cities = [city.strip() for city in cities_input.split(',')]
+    
+    if len(cities) < 2:
+        await update.message.reply_text(get_localized_message(prefs.language, "not_enough_cities"), parse_mode='HTML')
+        return
+    
+    if len(cities) > MAX_COMPARE_CITIES:
+        await update.message.reply_text(get_localized_message(prefs.language, "too_many_cities"))
+        cities = cities[:MAX_COMPARE_CITIES]
+    
+    await update.message.reply_chat_action(action="typing")
+    
+    weather_data_list = []
+    for city in cities:
+        data = await weather_api_client.get_current_weather(city, prefs.unit, prefs.language)
+        if data and not data.get("error"):
+            weather_data_list.append(data)
+        else:
+            await update.message.reply_text(get_localized_message(prefs.language, "city_not_found", city=city))
+            return # Stop comparison if any city is not found
+    
+    if not weather_data_list:
+        await update.message.reply_text(get_localized_message(prefs.language, "error_fetching_data_any_cities"))
+        return
+    
+    unit_symbol = "°C" if prefs.unit == "metric" else "°F"
+    
+    message = get_localized_message(prefs.language, "weather_comparison_title")
+    
+    # Temperature comparison
+    temps = [(data['name'], data['main']['temp']) for data in weather_data_list]
+    temps.sort(key=lambda x: x[1], reverse=True)
+    
+    message += get_localized_message(prefs.language, "temperature_comparison", unit_symbol=unit_symbol)
+    for i, (name, temp) in enumerate(temps, 1):
+        emoji = "🔥" if i == 1 else "🧊" if i == len(temps) else "🌡️"
+        message += f"{i}. {emoji} {name}: {temp:.1f}{unit_symbol}\n"
+    
+    message += "\n"
+    
+    # Humidity comparison
+    humidities = [(data['name'], data['main']['humidity']) for data in weather_data_list]
+    humidities.sort(key=lambda x: x[1], reverse=True)
+    
+    message += get_localized_message(prefs.language, "humidity_comparison")
+    for i, (name, humidity) in enumerate(humidities, 1):
+        emoji = "💧" if i == 1 else "🏜️" if i == len(humidities) else "💨"
+        message += f"{i}. {emoji} {name}: {humidity}%\n"
+    
+    message += "\n"
+    
+    # Weather conditions
+    message += get_localized_message(prefs.language, "current_conditions_comparison")
+    for data_item in weather_data_list:
+        name = data_item['name']
+        condition = data_item['weather'][0]['description'].title()
+        emoji = get_weather_emoji(data_item['weather'][0]['id'])
+        message += f"{emoji} {name}: {condition}\n"
+    
+    # Find extremes
+    message += get_localized_message(prefs.language, "highlights_comparison")
+    hottest = max(weather_data_list, key=lambda x: x['main']['temp'])
+    coldest = min(weather_data_list, key=lambda x: x['main']['temp'])
+    most_humid = max(weather_data_list, key=lambda x: x['main']['humidity'])
+    
+    message += get_localized_message(prefs.language, "hottest", city=hottest['name'], temp=hottest['main']['temp'], unit_symbol=unit_symbol) + "\n"
+    message += get_localized_message(prefs.language, "coldest", city=coldest['name'], temp=coldest['main']['temp'], unit_symbol=unit_symbol) + "\n"
+    message += get_localized_message(prefs.language, "most_humid", city=most_humid['name'], humidity=most_humid['main']['humidity'])
+    
+    await update.message.reply_text(message, parse_mode='HTML')
+
+async def weather_map(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Provide weather map link."""
+    user_id = update.effective_user.id
+    user_data_store: UserDataStore = context.bot_data['user_data_store']
+    weather_api_client: WeatherAPI = context.bot_data['weather_api_client']
+    prefs = user_data_store.get_user_prefs(user_id)
+
+    if not context.args:
+        await update.message.reply_text(get_localized_message(prefs.language, "specify_city_map"), parse_mode='HTML')
+        return
+    
+    city = " ".join(context.args)
+    
+    await update.message.reply_chat_action(action="typing")
+    geo_data = await weather_api_client.get_city_coordinates(city)
+    
+    if not geo_data:
+        await update.message.reply_text(get_localized_message(prefs.language, "error_generating_map"))
+        return
+    
+    if not geo_data:
+        await update.message.reply_text(get_localized_message(prefs.language, "city_not_found", city=city))
+        return
+    
+    lat = geo_data[0]['lat']
+    lon = geo_data[0]['lon']
+    name = geo_data[0]['name']
+    country = geo_data[0].get('country', '')
+    
+    openweather_map = f"https://openweathermap.org/weathermap?basemap=map&cities=true&layer=temperature&lat={lat}&lon={lon}&zoom=10"
+    Maps = f"https://www.google.com/maps/@{lat},{lon},10z"
+    
+    keyboard = [
+        [InlineKeyboardButton(get_localized_message(prefs.language, "openweather_map_button"), url=openweather_map)],
+        [InlineKeyboardButton(get_localized_message(prefs.language, "Maps_button"), url=Maps)]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    message = get_localized_message(prefs.language, "map_links", city=f"{name}, {country}")
+    await update.message.reply_text(message, parse_mode='HTML', reply_markup=reply_markup)
+
+async def handle_city_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle direct city name messages (non-command)."""
+    city = update.message.text.strip().strip('"\'')
+    user_id = update.effective_user.id
+    user_data_store: UserDataStore = context.bot_data['user_data_store']
+    weather_api_client: WeatherAPI = context.bot_data['weather_api_client']
+    prefs = user_data_store.get_user_prefs(user_id)
+    
+    # Auto-add frequently searched cities to favorites
+    if city.lower() not in [fav.lower() for fav in prefs.favorites] and len(prefs.favorites) < MAX_FAVORITES:
+        if await weather_api_client.verify_city_exists(city, prefs.language):
+            keyboard = [[InlineKeyboardButton(get_localized_message(prefs.language, "add_to_favorites_button"), callback_data=f"addfav_{city}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await send_current_weather(update, city, prefs, weather_api_client, suggest_favorite=reply_markup)
+        else:
+            await send_current_weather(update, city, prefs, weather_api_client)
+    else:
+        await send_current_weather(update, city, prefs, weather_api_client)
+
+# Helper functions that interact with API and send messages
+async def send_current_weather(update: Update, city: str, prefs: UserPreferences, weather_api_client: WeatherAPI, edit_message: bool = False, suggest_favorite=None):
+    """Fetches and sends current weather data."""
+    if not edit_message:
+        await update.message.reply_chat_action(action="typing")
+    
+    weather_data = await weather_api_client.get_current_weather(city, prefs.unit, prefs.language)
+
+    if not weather_data:
+        message = get_localized_message(prefs.language, "api_request_failed")
+        if weather_data and weather_data.get("error") == "city_not_found":
+            message = get_localized_message(prefs.language, "city_not_found_weather", city=city)
+        
+        if edit_message:
+            await update.callback_query.edit_message_text(message)
+        else:
+            await update.message.reply_text(message)
+        return
+
+    weather_message = format_weather_message(weather_data, prefs.language, prefs.unit)
+    
+    if edit_message:
+        await update.callback_query.edit_message_text(weather_message, parse_mode='HTML')
+    else:
+        await update.message.reply_text(weather_message, parse_mode='HTML', reply_markup=suggest_favorite)
+
+async def send_five_day_forecast(update: Update, city: str, prefs: UserPreferences, weather_api_client: WeatherAPI):
+    """Fetches and sends 5-day weather forecast."""
+    await update.message.reply_chat_action(action="typing")
+    
+    forecast_data = await weather_api_client.get_five_day_forecast(city, prefs.unit, prefs.language)
+
+    if not forecast_data:
+        message = get_localized_message(prefs.language, "error_fetching_forecast")
+        if forecast_data and forecast_data.get("error") == "city_not_found":
+            message = get_localized_message(prefs.language, "city_not_found", city=city)
+        
+        await update.message.reply_text(message)
+        return
+
+    forecast_message = format_forecast_message(forecast_data, prefs.language, prefs.unit)
+    await update.message.reply_text(forecast_message, parse_mode='HTML')
+</file>
+
+<file path="localization.py">
+MESSAGES = {
+    "en": {
+        "welcome": "🌤️ <b>Welcome to Advanced Weather Bot!</b> 🌤️\n\nI'm your comprehensive weather assistant with many features:\n\n🔹 Current weather for any city\n🔹 5-day detailed forecasts\n🔹 City search and suggestions\n🔹 Favorite locations\n🔹 Weather alerts\n🔹 City comparisons\n🔹 Customizable units & settings\n\nChoose a category below or type a city name to get started!",
+        "help": "🆘 <b>Weather Bot Commands</b>\n\n📍 <b>Weather Commands:</b>\n• <code>/weather [city]</code> - Current weather\n• <code>/forecast [city]</code> - 5-day forecast\n• <code>/alerts [city]</code> - Weather alerts\n\n🔍 <b>Search & Discovery:</b>\n• <code>/search [query]</code> - Find cities\n• <code>/map [city]</code> - Weather map link\n• <code>/compare city1,city2</code> - Compare cities\n\n⭐ <b>Favorites:</b>\n• <code>/favorites</code> - Show favorite cities\n• <code>/addfav [city]</code> - Add to favorites\n• <code>/removefav [city]</code> - Remove favorite\n\n⚙️ <b>Settings:</b>\n• <code>/settings</code> - Change preferences\n\n💡 <b>Tips:</b>\n• Just type a city name for quick weather\n• Use quotes for cities with spaces: 'New York'\n• Set a default city in settings",
+        "specify_city_weather": "Please specify a city! Usage: <code>/weather [city]</code>\nExample: <code>/weather London</code>\nOr set a default city in /settings",
+        "specify_city_forecast": "Please specify a city! Usage: <code>/forecast [city]</code>\nExample: <code>/forecast Tokyo</code>",
+        "specify_query_search": "Please provide a search query! Usage: <code>/search [query]</code>\nExample: <code>/search paris</code>",
+        "no_favorites": "You don't have any favorite cities yet!\nAdd some using <code>/addfav [city]</code>",
+        "favorites_list": "⭐ <b>Your Favorite Cities ({count})</b>\n\nClick on any city to get current weather:",
+        "specify_city_addfav": "Please specify a city! Usage: <code>/addfav [city]</code>",
+        "city_not_found": "🚫 City '{city}' not found. Please check the spelling.",
+        "added_favorite": "⭐ Added '{city}' to your favorites!",
+        "already_favorite": "'{city}' is already in your favorites!",
+        "specify_city_removefav": "Please specify a city! Usage: <code>/removefav [city]</code>",
+        "removed_favorite": "🗑️ Removed '{city}' from favorites!",
+        "not_in_favorites": "'{city}' is not in your favorites!",
+        "settings_menu": "⚙️ <b>Settings</b>\n\n🌡️ Temperature Unit: {unit}\n🌐 Language: {language}\n🏠 Default City: {default_city}\n⭐ Favorite Cities: {fav_count}\n\nClick the buttons below to change settings:",
+        "specify_city_alerts": "Please specify a city! Usage: <code>/alerts [city]</code>",
+        "alerts_for_city": "⚠️ <b>Weather Alerts for {city}</b>\n\n{alerts_list}\n\n🌡️ Current temp: {temp}",
+        "no_alerts": "✅ <b>No Weather Alerts for {city}</b>\n\nCurrent conditions are normal.",
+        "error_fetching_alerts": "❌ Could not fetch weather alerts. Please try again later.",
+        "specify_cities_compare": "Please specify cities to compare!\nUsage: <code>/compare city1,city2</code>\nExample: <code>/compare London,Paris</code>",
+        "not_enough_cities": "Please specify at least 2 cities separated by commas!\nExample: <code>/compare London,Paris</code>",
+        "too_many_cities": "You can compare up to 4 cities at once!",
+        "error_comparing_weather": "❌ Could not compare weather data. Please try again later.",
+        "specify_city_map": "Please specify a city! Usage: <code>/map [city]</code>",
+        "error_generating_map": "❌ Could not generate map links. Please try again later.",
+        "map_links": "🗺️ <b>Weather Maps for {city}</b>\n\nClick the links below to view interactive weather maps:",
+        "no_cities_found_search": "🚫 No cities found matching '{query}'",
+        "cities_matching_search": "🔍 <b>Cities matching '{query}':</b>\n\n{city_list}",
+        "error_searching_cities": "❌ Could not search for cities. Please try again later.",
+        "request_timeout": "⏰ Request timeout. Please try again later.",
+        "api_request_failed": "❌ Sorry, I couldn't fetch weather data right now. Please try again later.",
+        "unexpected_error": "❌ An unexpected error occurred. Please try again.",
+        "city_not_found_weather": "🚫 City '{city}' not found. Please check the spelling and try again.",
+        "error_fetching_forecast": "❌ Could not fetch forecast data. Please try again later.",
+        "units_celsius": "Celsius (°C)",
+        "units_fahrenheit": "Fahrenheit (°F)",
+        "default_city_not_set": "Not set",
+        "set_default_city_instructions": "🏠 To set a default city, use the command:\n<code>/addfav [city]</code> then come back to settings.\n\nOr just type a city name and I'll remember it!",
+        "manage_favorites_menu": "⭐ <b>Manage Favorite Cities</b>\n\nClick to remove a city:",
+        "reset_settings_confirm": "✅ All settings have been reset to default!",
+        "manage_favorites_back": "⬅️ Back to Settings",
+        "add_to_favorites_button": "⭐ Add to Favorites",
+        "manage_favorites_button": "⚙️ Manage Favorites",
+        "openweather_map_button": "🗺️ OpenWeather Map",
+        "Maps_button": "📍 Google Maps",
+        "temperature_comparison": "🌡️ <b>Temperature ({unit_symbol})</b>\n",
+        "humidity_comparison": "💧 <b>Humidity (%)</b>\n",
+        "current_conditions_comparison": "☁️ <b>Current Conditions</b>\n",
+        "highlights_comparison": "\n🏅 <b>Highlights</b>\n",
+        "hottest": "🔥 Hottest: {city} ({temp:.1f}{unit_symbol})",
+        "coldest": "🧊 Coldest: {city} ({temp:.1f}{unit_symbol})",
+        "most_humid": "💧 Most Humid: {city} ({humidity}%)",
+        "weather_comparison_title": "🏆 <b>Weather Comparison</b>\n\n",
+        "units_toggle_button": "🌡️ Units: {unit_name}",
+        "language_toggle_button": "🌐 Language: {language_name}",
+        "default_city_button": "🏠 Default City: {city_name}",
+        "reset_settings_button": "🗑️ Reset All Settings",
+        "choose_language": "🌐 <b>Choose your language:</b>",
+        "language_set": "🌐 Language set to {language_name}!",
+        "english": "English",
+        "arabic": "العربية",
+        "current_weather_button": "🌤️ Current Weather",
+        "five_day_forecast_button": "📊 5-Day Forecast",
+        "search_cities_button": "🔍 Search Cities",
+        "favorites_button": "⭐ Favorites",
+        "settings_button": "⚙️ Settings",
+        "weather_in_city": "Current Weather in {city}, {country}",
+        "temperature": "Temperature",
+        "feels_like": "Feels like",
+        "humidity": "Humidity",
+        "pressure": "Pressure",
+        "wind": "Wind",
+        "cloudiness": "Cloudiness",
+        "visibility": "Visibility",
+        "conditions": "Conditions",
+        "sunrise": "Sunrise",
+        "sunset": "Sunset",
+        "meters_per_second": "m/s",
+        "miles_per_hour": "mph",
+        "forecast_for_city": "5-Day Forecast for {city}, {country}",
+        "extreme_heat_warning": "Extreme Heat Warning!",
+        "extreme_cold_warning": "Extreme Cold Warning!",
+        "high_wind_alert": "High Wind Alert!",
+        "high_humidity_alert": "High Humidity Alert!",
+        "thunderstorm_alert": "Thunderstorm Alert!",
+        "heavy_rain_alert": "Heavy Rain Alert!",
+        "snow_alert": "Snow Alert!",
+        "error_fetching_data_any_cities": "❌ Could not fetch weather data for some cities. Please try again later."
+    },
+    "ar": {
+        "welcome": "🌤️ <b>أهلاً بك في بوت الطقس المتقدم!</b> 🌤️\n\nأنا مساعدك الشامل للطقس مع العديد من الميزات:\n\n🔹 الطقس الحالي لأي مدينة\n🔹 توقعات مفصلة لمدة 5 أيام\n🔹 بحث المدن واقتراحاتها\n🔹 المواقع المفضلة\n🔹 تنبيهات الطقس\n🔹 مقارنة المدن\n🔹 وحدات وإعدادات قابلة للتخصيص\n\nاختر فئة أدناه أو اكتب اسم مدينة للبدء!",
+        "help": "🆘 <b>أوامر بوت الطقس</b>\n\n📍 <b>أوامر الطقس:</b>\n• <code>/weather [مدينة]</code> - الطقس الحالي\n• <code>/forecast [مدينة]</code> - توقعات 5 أيام\n• <code>/alerts [مدينة]</code> - تنبيهات الطقس\n\n🔍 <b>البحث والاكتشاف:</b>\n• <code>/search [استعلام]</code> - البحث عن مدن\n• <code>/map [مدينة]</code> - رابط خريطة الطقس\n• <code>/compare مدينة1,مدينة2</code> - مقارنة المدن\n\n⭐ <b>المفضلة:</b>\n• <code>/favorites</code> - عرض المدن المفضلة\n• <code>/addfav [مدينة]</code> - إضافة إلى المفضلة\n• <code>/removefav [مدينة]</code> - إزالة من المفضلة\n\n⚙️ <b>الإعدادات:</b>\n• <code>/settings</code> - تغيير التفضيلات\n\n💡 <b>نصائح:</b>\n• فقط اكتب اسم مدينة للحصول على الطقس السريع\n• استخدم علامات الاقتباس للمدن التي تحتوي على مسافات: 'نيويورك'\n• قم بتعيين مدينة افتراضية في الإعدادات",
+        "specify_city_weather": "الرجاء تحديد مدينة! الاستخدام: <code>/weather [مدينة]</code>\nمثال: <code>/weather لندن</code>\nأو قم بتعيين مدينة افتراضية في /settings",
+        "specify_city_forecast": "الرجاء تحديد مدينة! الاستخدام: <code>/forecast [مدينة]</code>\nمثال: <code>/forecast طوكيو</code>",
+        "specify_query_search": "الرجاء تقديم استعلام بحث! الاستخدام: <code>/search [استعلام]</code>\nمثال: <code>/search باريس</code>",
+        "no_favorites": "ليس لديك أي مدن مفضلة بعد!\nأضف بعضها باستخدام <code>/addfav [مدينة]</code>",
+        "favorites_list": "⭐ <b>مدنك المفضلة ({count})</b>\n\nانقر على أي مدينة للحصول على الطقس الحالي:",
+        "specify_city_addfav": "الرجاء تحديد مدينة! الاستخدام: <code>/addfav [مدينة]</code>",
+        "city_not_found": "🚫 لم يتم العثور على مدينة '{city}'. يرجى التحقق من الإملاء.",
+        "added_favorite": "⭐ تمت إضافة '{city}' إلى مفضلاتك!",
+        "already_favorite": "'{city}' موجودة بالفعل في مفضلاتك!",
+        "specify_city_removefav": "الرجاء تحديد مدينة! الاستخدام: <code>/removefav [مدينة]</code>",
+        "removed_favorite": "🗑️ تمت إزالة '{city}' من المفضلة!",
+        "not_in_favorites": "'{city}' ليست في مفضلاتك!",
+        "settings_menu": "⚙️ <b>الإعدادات</b>\n\n🌡️ وحدة الحرارة: {unit}\n🌐 اللغة: {language}\n🏠 المدينة الافتراضية: {default_city}\n⭐ المدن المفضلة: {fav_count}\n\nانقر على الأزرار أدناه لتغيير الإعدادات:",
+        "specify_city_alerts": "الرجاء تحديد مدينة! الاستخدام: <code>/alerts [مدينة]</code>",
+        "alerts_for_city": "⚠️ <b>تنبيهات الطقس لـ {city}</b>\n\n{alerts_list}\n\n🌡️ درجة الحرارة الحالية: {temp}",
+        "no_alerts": "✅ <b>لا توجد تنبيهات طقس لـ {city}</b>\n\nالظروف الحالية طبيعية.",
+        "error_fetching_alerts": "❌ تعذر جلب تنبيهات الطقس. يرجى المحاولة مرة أخرى لاحقًا.",
+        "specify_cities_compare": "الرجاء تحديد المدن للمقارنة!\nالاستخدام: <code>/compare مدينة1,مدينة2</code>\nمثال: <code>/compare لندن,باريس</code>",
+        "not_enough_cities": "الرجاء تحديد مدينتين على الأقل مفصولة بفواصل!\nمثال: <code>/compare لندن,باريس</code>",
+        "too_many_cities": "يمكنك مقارنة ما يصل إلى 4 مدن في وقت واحد!",
+        "error_comparing_weather": "❌ تعذر مقارنة بيانات الطقس. يرجى المحاولة مرة أخرى لاحقًا.",
+        "specify_city_map": "الرجاء تحديد مدينة! الاستخدام: <code>/map [مدينة]</code>",
+        "error_generating_map": "❌ تعذر إنشاء روابط الخرائط. يرجى المحاولة مرة أخرى لاحقًا.",
+        "map_links": "🗺️ <b>خرائط الطقس لـ {city}</b>\n\nانقر على الروابط أدناه لعرض خرائط الطقس التفاعلية:",
+        "no_cities_found_search": "🚫 لم يتم العثور على مدن مطابقة لـ '{query}'",
+        "cities_matching_search": "🔍 <b>المدن المطابقة لـ '{query}':</b>\n\n{city_list}",
+        "error_searching_cities": "❌ تعذر البحث عن مدن. يرجى المحاولة مرة أخرى لاحقًا.",
+        "request_timeout": "⏰ انتهت مهلة الطلب. يرجى المحاولة مرة أخرى لاحقًا.",
+        "api_request_failed": "❌ عذراً، لم أتمكن من جلب بيانات الطقس الآن. يرجى المحاولة مرة أخرى لاحقًا.",
+        "unexpected_error": "❌ حدث خطأ غير متوقع. يرجى المحاولة مرة أخرى.",
+        "city_not_found_weather": "🚫 لم يتم العثور على مدينة '{city}'. يرجى التحقق من الإملاء والمحاولة مرة أخرى.",
+        "error_fetching_forecast": "❌ تعذر جلب بيانات التوقعات. يرجى المحاولة مرة أخرى لاحقًا.",
+        "units_celsius": "مئوية (°م)",
+        "units_fahrenheit": "فهرنهايت (°ف)",
+        "default_city_not_set": "لم يتم التعيين",
+        "set_default_city_instructions": "🏠 لتعيين مدينة افتراضية، استخدم الأمر:\n<code>/addfav [مدينة]</code> ثم ارجع إلى الإعدادات.\n\nأو فقط اكتب اسم مدينة وسأتذكرها!",
+        "manage_favorites_menu": "⭐ <b>إدارة المدن المفضلة</b>\n\nانقر لإزالة مدينة:",
+        "reset_settings_confirm": "✅ تم إعادة تعيين جميع الإعدادات إلى الافتراضي!",
+        "manage_favorites_back": "⬅️ العودة إلى الإعدادات",
+        "add_to_favorites_button": "⭐ إضافة إلى المفضلة",
+        "manage_favorites_button": "⚙️ إدارة المفضلة",
+        "openweather_map_button": "🗺️ خريطة OpenWeather",
+        "Maps_button": "📍 خرائط جوجل",
+        "temperature_comparison": "🌡️ <b>درجة الحرارة ({unit_symbol})</b>\n",
+        "humidity_comparison": "💧 <b>الرطوبة (%)</b>\n",
+        "current_conditions_comparison": "☁️ <b>الظروف الحالية</b>\n",
+        "highlights_comparison": "\n🏅 <b>النقاط الرئيسية</b>\n",
+        "hottest": "🔥 الأكثر حرارة: {city} ({temp:.1f}{unit_symbol})",
+        "coldest": "🧊 الأبرد: {city} ({temp:.1f}{unit_symbol})",
+        "most_humid": "💧 الأكثر رطوبة: {city} ({humidity}%)",
+        "weather_comparison_title": "🏆 <b>مقارنة الطقس</b>\n\n",
+        "units_toggle_button": "🌡️ الوحدات: {unit_name}",
+        "language_toggle_button": "🌐 اللغة: {language_name}",
+        "default_city_button": "🏠 المدينة الافتراضية: {city_name}",
+        "reset_settings_button": "🗑️ إعادة تعيين جميع الإعدادات",
+        "choose_language": "🌐 <b>اختر لغتك:</b>",
+        "language_set": "🌐 تم تعيين اللغة إلى {language_name}!",
+        "english": "الإنجليزية",
+        "arabic": "العربية",
+        "current_weather_button": "🌤️ الطقس الحالي",
+        "five_day_forecast_button": "📊 توقعات 5 أيام",
+        "search_cities_button": "🔍 البحث عن مدن",
+        "favorites_button": "⭐ المفضلة",
+        "settings_button": "⚙️ الإعدادات",
+        "weather_in_city": "الطقس الحالي في {city}, {country}",
+        "temperature": "درجة الحرارة",
+        "feels_like": "الشعور كأن",
+        "humidity": "الرطوبة",
+        "pressure": "الضغط",
+        "wind": "الرياح",
+        "cloudiness": "الغيوم",
+        "visibility": "الرؤية",
+        "conditions": "الظروف",
+        "sunrise": "شروق الشمس",
+        "sunset": "غروب الشمس",
+        "meters_per_second": "م/ث",
+        "miles_per_hour": "ميل/ساعة",
+        "forecast_for_city": "توقعات 5 أيام لـ {city}, {country}",
+        "extreme_heat_warning": "تحذير من حرارة شديدة!",
+        "extreme_cold_warning": "تحذير من برد شديد!",
+        "high_wind_alert": "تحذير من رياح قوية!",
+        "high_humidity_alert": "تحذير من رطوبة عالية!",
+        "thunderstorm_alert": "تحذير من عاصفة رعدية!",
+        "heavy_rain_alert": "تحذير من أمطار غزيرة!",
+        "snow_alert": "تحذير من تساقط ثلوج!",
+        "error_fetching_data_any_cities": "❌ تعذر جلب بيانات الطقس لبعض المدن. يرجى المحاولة مرة أخرى لاحقًا."
+    }
+}
+
+def get_localized_message(user_language: str, key: str, **kwargs) -> str:
+    """Get a localized message based on user's language."""
+    return MESSAGES.get(user_language, MESSAGES["en"]).get(key, MESSAGES["en"][key]).format(**kwargs)
+</file>
+
+<file path="main.py">
+import logging
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+
+# Import modules from your new structure
+from config import TELEGRAM_BOT_TOKEN, WEATHER_API_KEY
+from data_store import UserDataStore
+from weather_api import WeatherAPI
+from handlers import command_handlers, callback_handlers # Import the handler modules
+
+# Enable logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+def main():
+    """Starts the bot."""
+    if not TELEGRAM_BOT_TOKEN or not WEATHER_API_KEY:
+        logger.error("Bot cannot start: Missing required environment variables. Please check config.py or your .env file.")
+        return
+
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # Initialize shared resources and store them in bot_data
+    user_data_store = UserDataStore()
+    weather_api_client = WeatherAPI(WEATHER_API_KEY)
+    
+    application.bot_data['user_data_store'] = user_data_store
+    application.bot_data['weather_api_client'] = weather_api_client
+
+    # Command handlers
+    application.add_handler(CommandHandler("start", command_handlers.start_command))
+    application.add_handler(CommandHandler("help", command_handlers.help_command))
+    application.add_handler(CommandHandler("weather", command_handlers.weather_command))
+    application.add_handler(CommandHandler("forecast", command_handlers.forecast_command))
+    application.add_handler(CommandHandler("search", command_handlers.search_cities))
+    application.add_handler(CommandHandler("favorites", command_handlers.favorites_command))
+    application.add_handler(CommandHandler("addfav", command_handlers.add_favorite))
+    application.add_handler(CommandHandler("removefav", command_handlers.remove_favorite))
+    application.add_handler(CommandHandler("settings", command_handlers.settings_command))
+    application.add_handler(CommandHandler("alerts", command_handlers.weather_alerts))
+    application.add_handler(CommandHandler("compare", command_handlers.compare_cities))
+    application.add_handler(CommandHandler("map", command_handlers.weather_map))
+    
+    # Callback query handler for inline keyboards
+    application.add_handler(CallbackQueryHandler(callback_handlers.handle_callback))
+    
+    # Message handler for city names
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND, 
+        command_handlers.handle_city_message
+    ))
+
+    # Error handler
+    application.add_error_handler(error_handler)
+
+    print("🚀 Starting Enhanced Weather Bot...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle errors."""
+    logger.error(f"Exception while handling an update: {context.error}")
+    if update and update.effective_message:
+        user_id = update.effective_user.id
+        user_data_store = context.bot_data.get('user_data_store')
+        prefs = user_data_store.get_user_prefs(user_id)
+        await update.effective_message.reply_text(get_localized_message(prefs.language, "unexpected_error"))
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n🛑 Bot stopped by user")
+    except Exception as e:
+        logger.critical(f"Failed to start bot: {e}")
+        print(f"❌ Critical Error: {e}")
+</file>
+
+<file path="utils.py">
+from datetime import datetime
+from localization import get_localized_message
+from typing import Dict, Any
+
+def get_weather_emoji(weather_id: int) -> str:
+    """Get appropriate emoji for weather condition based on OpenWeatherMap weather ID."""
+    if weather_id < 300:
+        return "⛈️"  # Thunderstorm
+    elif weather_id < 400:
+        return "🌦️"  # Drizzle
+    elif weather_id < 600:
+        return "🌧️"  # Rain
+    elif weather_id < 700:
+        return "❄️"  # Snow
+    elif weather_id < 800:
+        return "🌫️"  # Atmosphere (fog, mist, etc.)
+    elif weather_id == 800:
+        return "☀️"  # Clear sky
+    else:
+        return "☁️"  # Clouds
+
+def format_weather_message(data: Dict[str, Any], prefs_lang: str, unit: str) -> str:
+    """Format current weather data into a readable message."""
+    city = data['name']
+    country = data['sys']['country']
+    temp = data['main']['temp']
+    feels_like = data['main']['feels_like']
+    humidity = data['main']['humidity']
+    pressure = data['main']['pressure']
+    description = data['weather'][0]['description'].title()
+    
+    wind_speed = data.get('wind', {}).get('speed', 0)
+    wind_deg = data.get('wind', {}).get('deg', 0)
+    visibility = data.get('visibility', 0) / 1000 if data.get('visibility') else None
+    clouds = data.get('clouds', {}).get('all', 0)
+    
+    sunrise = datetime.fromtimestamp(data['sys']['sunrise']).strftime('%H:%M')
+    sunset = datetime.fromtimestamp(data['sys']['sunset']).strftime('%H:%M')
+    
+    weather_id = data['weather'][0]['id']
+    emoji = get_weather_emoji(weather_id)
+    
+    if unit == 'metric':
+        temp_unit = "°C"
+        speed_unit = get_localized_message(prefs_lang, "meters_per_second")
+    else:
+        temp_unit = "°F"
+        speed_unit = get_localized_message(prefs_lang, "miles_per_hour")
+    
+    temp = round(temp)
+    feels_like = round(feels_like)
+
+    # Simplified wind direction logic
+    wind_directions = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+                      "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
+    wind_dir = wind_directions[round(wind_deg / 22.5) % 16] if wind_deg is not None else "N/A"
+    
+    message = (
+        f"{emoji} <b>{get_localized_message(prefs_lang, 'weather_in_city', city=city, country=country)}</b>\n\n"
+        f"🌡️ {get_localized_message(prefs_lang, 'temperature')}: {temp}{temp_unit}\n"
+        f"🤔 {get_localized_message(prefs_lang, 'feels_like')}: {feels_like}{temp_unit}\n"
+        f"💧 {get_localized_message(prefs_lang, 'humidity')}: {humidity}%\n"
+        f"📊 {get_localized_message(prefs_lang, 'pressure')}: {pressure} hPa\n"
+        f"💨 {get_localized_message(prefs_lang, 'wind')}: {wind_speed:.1f} {speed_unit} {wind_dir}\n"
+        f"☁️ {get_localized_message(prefs_lang, 'cloudiness')}: {clouds}%\n"
+    )
+    
+    if visibility is not None:
+        message += f"👁️ {get_localized_message(prefs_lang, 'visibility')}: {visibility:.1f} km\n"
+    
+    message += (
+        f"📝 {get_localized_message(prefs_lang, 'conditions')}: {description}\n\n"
+        f"🌅 {get_localized_message(prefs_lang, 'sunrise')}: {sunrise}\n"
+        f"🌇 {get_localized_message(prefs_lang, 'sunset')}: {sunset}"
+    )
+    
+    return message
+
+def format_forecast_message(data: Dict[str, Any], prefs_lang: str, unit: str) -> str:
+    """Format 5-day forecast data into a readable message."""
+    city = data['city']['name']
+    country = data['city']['country']
+    
+    unit_symbol = "°C" if unit == "metric" else "°F"
+    
+    message = get_localized_message(prefs_lang, "forecast_for_city", city=city, country=country) + "\n\n"
+    
+    daily_forecasts = {}
+    for item in data['list']:
+        date = datetime.fromtimestamp(item['dt']).date()
+        if date not in daily_forecasts:
+            daily_forecasts[date] = []
+        daily_forecasts[date].append(item)
+    
+    for i, (date, forecasts) in enumerate(list(daily_forecasts.items())[:5]):
+        day_name = date.strftime('%A')
+        date_str = date.strftime('%m/%d')
+        
+        temps = [f['main']['temp'] for f in forecasts]
+        min_temp = min(temps)
+        max_temp = max(temps)
+        
+        conditions = [f['weather'][0] for f in forecasts]
+        main_condition_group = max(set(c['main'] for c in conditions), 
+                                   key=[c['main'] for c in conditions].count)
+        
+        # Get a representative description, prefer one matching the main condition group
+        representative_description = next((c['description'].title() for c in conditions if c['main'] == main_condition_group), conditions[0]['description'].title())
+        
+        weather_ids = [c['id'] for c in conditions if c['main'] == main_condition_group]
+        representative_id = weather_ids[0] if weather_ids else conditions[0]['id']
+        
+        emoji = get_weather_emoji(representative_id)
+        
+        pop = max([f.get('pop', 0) for f in forecasts]) * 100
+        
+        message += f"{emoji} <b>{day_name} ({date_str})</b>\n"
+        message += f"   🌡️ {min_temp:.0f}{unit_symbol} - {max_temp:.0f}{unit_symbol}"
+        
+        if pop > 20:
+            message += f" | 🌧️ {pop:.0f}%"
+        
+        message += f"\n   📝 {representative_description}\n\n"
+        
+    return message
+</file>
+
+<file path="weather_api.py">
+import requests
+import logging
+from typing import Dict, Any, Optional
+from config import WEATHER_API_KEY, WEATHER_API_URL, FORECAST_API_URL, GEOCODING_API_URL, REQUEST_TIMEOUT
+
+logger = logging.getLogger(__name__)
+
+class WeatherAPI:
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+
+    async def get_current_weather(self, city: str, unit: str, lang: str) -> Optional[Dict[str, Any]]:
+        """Fetches current weather data for a given city."""
+        params = {
+            'q': city,
+            'appid': self.api_key,
+            'units': unit,
+            'lang': lang
+        }
+        try:
+            response = requests.get(WEATHER_API_URL, params=params, timeout=REQUEST_TIMEOUT)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.Timeout:
+            logger.error(f"Weather API request timed out for {city}")
+            return None
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error fetching current weather for {city}: {e}")
+            if response.status_code == 404:
+                return {"error": "city_not_found"}
+            return None
+
+    async def get_five_day_forecast(self, city: str, unit: str, lang: str) -> Optional[Dict[str, Any]]:
+        """Fetches 5-day weather forecast data for a given city."""
+        params = {
+            'q': city,
+            'appid': self.api_key,
+            'units': unit,
+            'lang': lang
+        }
+        try:
+            response = requests.get(FORECAST_API_URL, params=params, timeout=REQUEST_TIMEOUT)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.Timeout:
+            logger.error(f"Forecast API request timed out for {city}")
+            return None
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error fetching forecast for {city}: {e}")
+            if response.status_code == 404:
+                return {"error": "city_not_found"}
+            return None
+
+    async def get_city_coordinates(self, query: str) -> Optional[list]:
+        """Fetches geographical coordinates for a city query."""
+        params = {
+            'q': query,
+            'appid': self.api_key,
+            'limit': 10
+        }
+        try:
+            response = requests.get(GEOCODING_API_URL, params=params, timeout=REQUEST_TIMEOUT)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.Timeout:
+            logger.error(f"Geocoding API request timed out for {query}")
+            return None
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error fetching coordinates for {query}: {e}")
+            return None
+
+    async def verify_city_exists(self, city: str, lang: str) -> bool:
+        """Verifies if a city exists by trying to fetch its current weather."""
+        params = {
+            'q': city,
+            'appid': self.api_key,
+            'units': 'metric', # Unit doesn't matter for existence check
+            'lang': lang
+        }
+        try:
+            response = requests.get(WEATHER_API_URL, params=params, timeout=5)
+            return response.status_code == 200
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error verifying city {city}: {e}")
+            return False
 </file>
 
 <file path="docker-compose.yml">

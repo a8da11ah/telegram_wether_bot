@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyd
+*.so
+*.egg
+*.egg-info/
+.Python
+build/
+dist/
+venv/
+.venv/
+env/
+.env/
+
+# Data storage
+# This ignores the local user data file created by data_store.py
+user_data.json
+
+# IDEs and Editors
+.idea/             # PyCharm
+.vscode/           # VS Code
+*.iml              # IntelliJ IDEA (often used with Python projects)
+.DS_Store          # macOS specific
+Thumbs.db          # Windows specific
+
+# Logs and other temporary files
+*.log
+*.tmp
